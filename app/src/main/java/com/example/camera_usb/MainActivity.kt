@@ -8,12 +8,15 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Matrix
+import android.graphics.Rect
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
@@ -31,12 +34,14 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -57,6 +62,9 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -66,6 +74,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
@@ -85,22 +95,37 @@ import kotlin.math.abs
 
 private const val LOGITECH_VENDOR_ID = 0x046D
 private const val USB_CAMERA_ID = "usb_uvc"
+const val ACTION_OPEN_USB_CAMERA = "com.example.camera_usb.action.OPEN_USB_CAMERA"
 private enum class PreviewScaleMode { FIT, FILL }
 
 class MainActivity : ComponentActivity() {
+    private var autoOpenUsb by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        autoOpenUsb = intent?.action == ACTION_OPEN_USB_CAMERA || intent?.action == UsbManager.ACTION_USB_DEVICE_ATTACHED
         enableEdgeToEdge()
         setContent {
             Camera_usbTheme {
-                CameraApp()
+                CameraApp(autoOpenUsbOnStart = autoOpenUsb)
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        this.intent = intent
+        if (intent.action == ACTION_OPEN_USB_CAMERA || intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) {
+            autoOpenUsb = true
         }
     }
 }
 
 @Composable
-private fun CameraApp(viewModel: CameraViewModel = viewModel()) {
+private fun CameraApp(
+    autoOpenUsbOnStart: Boolean,
+    viewModel: CameraViewModel = viewModel()
+) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     var hasPermission by remember {
@@ -137,6 +162,7 @@ private fun CameraApp(viewModel: CameraViewModel = viewModel()) {
 
     CameraScreen(
         uiState = uiState,
+        autoOpenUsbOnStart = autoOpenUsbOnStart,
         onSelectLensFacing = viewModel::selectByLensFacing,
         onCamerasLoaded = viewModel::onCamerasLoaded,
         onBindingError = viewModel::onBindingError,
@@ -146,9 +172,11 @@ private fun CameraApp(viewModel: CameraViewModel = viewModel()) {
     )
 }
 
+@SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
 @Composable
 private fun CameraScreen(
     uiState: CameraUiState,
+    autoOpenUsbOnStart: Boolean,
     onSelectLensFacing: (Int) -> Unit,
     onCamerasLoaded: (List<CameraDeviceUi>) -> Unit,
     onBindingError: (Throwable) -> Unit,
@@ -163,6 +191,7 @@ private fun CameraScreen(
 
     var cameraDevice by remember { mutableStateOf<CameraDevice?>(null) }
     var captureSession by remember { mutableStateOf<CameraCaptureSession?>(null) }
+    var internalPreviewSurface by remember { mutableStateOf<Surface?>(null) }
     var surfaceReadyTick by remember { mutableIntStateOf(0) }
     var preferredUsbDevice by remember { mutableStateOf<UsbDevice?>(null) }
     var usbPermissionTarget by remember { mutableStateOf<UsbDevice?>(null) }
@@ -173,11 +202,16 @@ private fun CameraScreen(
     var usbAutoConfiguredDeviceId by remember { mutableStateOf<Int?>(null) }
     var usbPreferredSize by remember { mutableStateOf<Size?>(null) }
     val internalPreferredSize = remember { mutableStateMapOf<String, AndroidSize>() }
+    val previewScaleModeByCamera = remember { mutableStateMapOf<String, PreviewScaleMode>() }
     var showCameraSettingsDialog by remember { mutableStateOf(false) }
+    var settingsCameraId by remember { mutableStateOf<String?>(null) }
+    var settingsIsUsb by remember { mutableStateOf(false) }
+    var isSettingsLoading by remember { mutableStateOf(false) }
     var usbSizeOptions by remember { mutableStateOf<List<Size>>(emptyList()) }
     var internalSizeOptions by remember { mutableStateOf<List<AndroidSize>>(emptyList()) }
-    var previewScaleMode by remember { mutableStateOf(PreviewScaleMode.FIT) }
+    var previewScaleMode by remember { mutableStateOf(PreviewScaleMode.FILL) }
     var currentPreviewAspect by remember { mutableStateOf(16f / 9f) }
+    var pendingAutoUsbOpen by remember { mutableStateOf(autoOpenUsbOnStart) }
     val selectedCameraIdLatest by rememberUpdatedState(uiState.selectedCameraId)
 
     LaunchedEffect(uiState.alert?.timestamp) {
@@ -194,7 +228,7 @@ private fun CameraScreen(
 
     val previewView = remember {
         AspectRatioTextureView(context).apply {
-            setAspectRatio(1280, 720)
+            setAspectRatio(9, 16)
         }
     }
 
@@ -206,8 +240,10 @@ private fun CameraScreen(
         runCatching { captureSession?.stopRepeating() }
         runCatching { captureSession?.close() }
         runCatching { cameraDevice?.close() }
+        runCatching { internalPreviewSurface?.release() }
         captureSession = null
         cameraDevice = null
+        internalPreviewSurface = null
     }
 
     val closeUsbCamera: () -> Unit = {
@@ -301,15 +337,94 @@ private fun CameraScreen(
                 .onFailure(onBindingError)
     }
 
+    fun requestUsbTapFocus(): Boolean {
+        val methods = listOf("startFocus", "startCameraFocus", "requestFocus", "autoFocus")
+        methods.forEach { name ->
+            runCatching {
+                val noArgMethod = uvcHelper.javaClass.methods.firstOrNull { it.name == name && it.parameterCount == 0 }
+                if (noArgMethod != null) {
+                    noArgMethod.invoke(uvcHelper)
+                    return true
+                }
+                val boolMethod = uvcHelper.javaClass.methods.firstOrNull {
+                    it.name == name && it.parameterCount == 1 && it.parameterTypes.firstOrNull() == Boolean::class.javaPrimitiveType
+                }
+                if (boolMethod != null) {
+                    boolMethod.invoke(uvcHelper, true)
+                    return true
+                }
+            }
+        }
+
+        runCatching {
+            val autoFocusMethod = uvcHelper.javaClass.methods.firstOrNull {
+                it.name == "setAutoFocus" && it.parameterCount == 1 && it.parameterTypes.firstOrNull() == Boolean::class.javaPrimitiveType
+            }
+            if (autoFocusMethod != null) {
+                autoFocusMethod.invoke(uvcHelper, true)
+                return true
+            }
+        }
+
+        return false
+    }
+
+    fun requestTapFocus(tapX: Float, tapY: Float) {
+        val selected = uiState.cameras.firstOrNull { it.id == uiState.selectedCameraId } ?: return
+
+        if (selected.lensFacing == CameraCharacteristics.LENS_FACING_EXTERNAL) {
+            requestUsbTapFocus()
+            return
+        }
+
+        val device = cameraDevice ?: return
+        val session = captureSession ?: return
+        val surface = internalPreviewSurface ?: return
+
+        val chars = runCatching { cameraManager.getCameraCharacteristics(selected.id) }.getOrNull()
+        val activeRect = chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        val maxAfRegions = chars?.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
+
+        val focusBuilder = runCatching {
+            device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(surface)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                if (activeRect != null && maxAfRegions > 0 && previewView.width > 0 && previewView.height > 0) {
+                    val meteringRect = buildMeteringRect(
+                        tapX = tapX,
+                        tapY = tapY,
+                        viewWidth = previewView.width,
+                        viewHeight = previewView.height,
+                        sensorRect = activeRect
+                    )
+                    set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(meteringRect))
+                    set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(meteringRect))
+                }
+                set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+            }
+        }.getOrNull() ?: return
+
+        runCatching {
+            session.capture(focusBuilder.build(), null, cameraHandler)
+
+            focusBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            focusBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            session.setRepeatingRequest(focusBuilder.build(), null, cameraHandler)
+        }
+    }
+
     DisposableEffect(previewView) {
         previewView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+                previewView.setAspectRatio(width, height)
                 surfaceReadyTick++
                 applyPreviewTransform(previewView, currentPreviewAspect, previewScaleMode)
                 attachUsbPreviewSurfaceIfReady()
             }
 
             override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+                previewView.setAspectRatio(width, height)
                 surfaceReadyTick++
                 applyPreviewTransform(previewView, currentPreviewAspect, previewScaleMode)
                 attachUsbPreviewSurfaceIfReady()
@@ -361,7 +476,6 @@ private fun CameraScreen(
                 uvcHelper.startPreview()
                 val size = uvcHelper.getPreviewSize()
                 if (size != null) {
-                    previewView.setAspectRatio(size.width, size.height)
                     currentPreviewAspect = size.width / size.height.toFloat()
                 }
                 attachUsbPreviewSurfaceIfReady()
@@ -473,7 +587,33 @@ private fun CameraScreen(
         refreshSources()
     }
 
+    LaunchedEffect(uiState.cameras, pendingAutoUsbOpen) {
+        if (!pendingAutoUsbOpen) return@LaunchedEffect
+        val hasUsb = uiState.cameras.any { it.lensFacing == CameraCharacteristics.LENS_FACING_EXTERNAL }
+        if (hasUsb) {
+            onSelectLensFacing(CameraCharacteristics.LENS_FACING_EXTERNAL)
+        }
+        pendingAutoUsbOpen = false
+    }
+
     val selectedCameraId = uiState.selectedCameraId
+
+    LaunchedEffect(selectedCameraId, uiState.cameras) {
+        val selected = uiState.cameras.firstOrNull { it.id == selectedCameraId } ?: return@LaunchedEffect
+        previewScaleMode = previewScaleModeByCamera[selected.id] ?: PreviewScaleMode.FILL
+    }
+
+    LaunchedEffect(showCameraSettingsDialog, settingsCameraId, settingsIsUsb) {
+        if (!showCameraSettingsDialog) return@LaunchedEffect
+        val cameraId = settingsCameraId ?: return@LaunchedEffect
+        isSettingsLoading = true
+        if (settingsIsUsb) {
+            usbSizeOptions = uvcHelper.getSupportedSizeList().orEmpty()
+        } else {
+            internalSizeOptions = internalSupportedSizes(cameraId)
+        }
+        isSettingsLoading = false
+    }
 
     LaunchedEffect(selectedCameraId, surfaceReadyTick, uiState.cameras) {
         val selected = uiState.cameras.firstOrNull { it.id == selectedCameraId }
@@ -514,12 +654,13 @@ private fun CameraScreen(
             ?: findBestInternalSize(internalSupportedSizes(cameraId), 1280, 720)
         val previewWidth = preferred?.width ?: if (previewView.width > 0) previewView.width else 1280
         val previewHeight = preferred?.height ?: if (previewView.height > 0) previewView.height else 720
-        previewView.setAspectRatio(previewWidth, previewHeight)
         currentPreviewAspect = previewWidth / previewHeight.toFloat()
         surfaceTexture.setDefaultBufferSize(previewWidth, previewHeight)
-        val previewSurface = Surface(surfaceTexture)
 
         closeInternalCamera()
+
+        val previewSurface = Surface(surfaceTexture)
+        internalPreviewSurface = previewSurface
 
         openCamera(
             context = context,
@@ -555,82 +696,53 @@ private fun CameraScreen(
     val isUsbSelected = uiState.cameras.any {
         it.id == uiState.selectedCameraId && it.lensFacing == CameraCharacteristics.LENS_FACING_EXTERNAL
     }
-    val activeLabel = when {
-        isBackSelected -> "الخلفية"
-        isFrontSelected -> "الأمامية"
-        isUsbSelected -> "كاميرا USB"
-        else -> "غير محدد"
-    }
+    val isCompactHeight = LocalConfiguration.current.screenHeightDp < 700
 
     Scaffold(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(
-                brush = Brush.verticalGradient(
-                    colors = listOf(Color(0xFF08121F), Color(0xFF132A46))
-                )
-            ),
-        containerColor = Color.Transparent
-    ) { innerPadding ->
+        modifier = Modifier.fillMaxSize(),
+        containerColor = Color.Black
+    ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding)
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .statusBarsPadding()
-                    .padding(horizontal = 16.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
-            ) {
-                Text(
-                    text = "Smart Camera",
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-                Text(
-                    text = "الكاميرا النشطة: $activeLabel",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFFD7E7FF)
-                )
-
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    shape = RoundedCornerShape(24.dp),
-                    tonalElevation = 4.dp,
-                    shadowElevation = 10.dp,
-                    color = Color.Black.copy(alpha = 0.65f)
-                ) {
-                    Box(modifier = Modifier.fillMaxSize()) {
-                        AndroidView(
-                            factory = { previewView },
-                            modifier = Modifier.fillMaxSize()
-                        )
-
-                        if (uiState.isLoading) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.align(Alignment.Center),
-                                color = Color.White
-                            )
-                        }
-
-                        if (uiState.cameras.isEmpty() && !uiState.isLoading) {
-                            Text(
-                                text = "No camera source detected",
-                                modifier = Modifier.align(Alignment.Center),
-                                color = Color.White
-                            )
-                        }
+                .background(Color.Black)
+                .pointerInput(uiState.selectedCameraId, cameraDevice, captureSession, usbOpenedDeviceId) {
+                    detectTapGestures { offset ->
+                        requestTapFocus(offset.x, offset.y)
                     }
                 }
+        ) {
+            AndroidView(
+                factory = { previewView },
+                modifier = Modifier.fillMaxSize()
+            )
 
+            if (uiState.isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.align(Alignment.Center),
+                    color = Color.White
+                )
+            }
+
+            if (uiState.cameras.isEmpty() && !uiState.isLoading) {
+                Text(
+                    text = "لم يتم العثور على أي كاميرا",
+                    modifier = Modifier.align(Alignment.Center),
+                    color = Color.White
+                )
+            }
+
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .navigationBarsPadding()
+                    .padding(horizontal = 14.dp, vertical = if (isCompactHeight) 8.dp else 12.dp)
+                    .background(Color.Black.copy(alpha = 0.45f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 10.dp, vertical = if (isCompactHeight) 8.dp else 10.dp)
+            ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     QuickSwitchButton(
                         modifier = Modifier.weight(1f),
@@ -651,7 +763,7 @@ private fun CameraScreen(
                         label = "USB",
                         active = isUsbSelected,
                         enabled = hasUsb,
-                    onClick = {
+                        onClick = {
                             val targetUsb = usbManager.deviceList.values
                                 .filter { it.isVideoClassDevice() }
                                 .firstOrNull { it.vendorId == LOGITECH_VENDOR_ID }
@@ -675,46 +787,54 @@ private fun CameraScreen(
                     )
                 }
 
-                Button(
-                    onClick = {
-                        previewScaleMode = if (previewScaleMode == PreviewScaleMode.FIT) {
-                            PreviewScaleMode.FILL
-                        } else {
-                            PreviewScaleMode.FIT
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF304B6D),
-                        contentColor = Color.White
-                    )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    val modeText = if (previewScaleMode == PreviewScaleMode.FIT) "ملاءمة" else "ملء الشاشة"
-                    Text("وضع العرض: $modeText")
-                }
+                    Button(
+                        onClick = {
+                            val selected = uiState.cameras.firstOrNull { it.id == uiState.selectedCameraId }
+                                ?: return@Button
+                            val nextMode = if (previewScaleMode == PreviewScaleMode.FIT) {
+                                PreviewScaleMode.FILL
+                            } else {
+                                PreviewScaleMode.FIT
+                            }
+                            previewScaleMode = nextMode
+                            previewScaleModeByCamera[selected.id] = nextMode
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF304B6D),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        val modeText = if (previewScaleMode == PreviewScaleMode.FIT) "ملاءمة" else "ملء"
+                        Text("حجم العرض: $modeText")
+                    }
 
-                Button(
-                    onClick = {
-                        val selected = uiState.cameras.firstOrNull { it.id == uiState.selectedCameraId }
-                        if (selected == null) return@Button
-                        if (selected.lensFacing == CameraCharacteristics.LENS_FACING_EXTERNAL) {
-                            usbSizeOptions = uvcHelper.getSupportedSizeList().orEmpty()
-                        } else {
-                            internalSizeOptions = internalSupportedSizes(selected.id)
-                        }
-                        showCameraSettingsDialog = true
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF223A5A),
-                        contentColor = Color.White
-                    )
-                ) {
-                    Text("إعدادات الكاميرا")
+                    Button(
+                        onClick = {
+                            val selected = uiState.cameras.firstOrNull { it.id == uiState.selectedCameraId }
+                            if (selected == null) return@Button
+                            settingsCameraId = selected.id
+                            settingsIsUsb = selected.lensFacing == CameraCharacteristics.LENS_FACING_EXTERNAL
+                            isSettingsLoading = true
+                            showCameraSettingsDialog = true
+                        },
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF223A5A),
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Text("الإعدادات")
+                    }
                 }
-
             }
 
             val pendingDevice = usbPermissionTarget
@@ -734,12 +854,17 @@ private fun CameraScreen(
             }
 
             if (showCameraSettingsDialog) {
-                val selected = uiState.cameras.firstOrNull { it.id == uiState.selectedCameraId }
+                val selected = settingsCameraId?.let { targetId ->
+                    uiState.cameras.firstOrNull { it.id == targetId }
+                }
                 if (selected != null) {
                     CameraSettingsDialog(
-                        isUsb = selected.lensFacing == CameraCharacteristics.LENS_FACING_EXTERNAL,
+                        isUsb = settingsIsUsb,
+                        isLoading = isSettingsLoading,
                         usbOptions = usbSizeOptions,
                         internalOptions = internalSizeOptions,
+                        selectedUsb = usbPreferredSize,
+                        selectedInternal = internalPreferredSize[selected.id],
                         onSelectUsb = { size ->
                             usbPreferredSize = size
                             if (uvcHelper.isCameraOpened()) {
@@ -762,23 +887,25 @@ private fun CameraScreen(
                             showCameraSettingsDialog = false
                         },
                         onDismiss = {
+                            isSettingsLoading = false
                             showCameraSettingsDialog = false
                         }
-                )
+                    )
+                }
             }
 
             uiState.alert?.let { alert ->
                 BottomAlertBar(
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                        .navigationBarsPadding()
+                        .padding(horizontal = 14.dp, vertical = 90.dp),
                     alert = alert,
                     onClose = onClearAlert
                 )
             }
         }
     }
-}
 }
 
 @SuppressLint("MissingPermission")
@@ -874,6 +1001,27 @@ private fun findBestInternalSize(
         val swapped = abs(size.height - targetWidth) + abs(size.width - targetHeight)
         minOf(direct, swapped)
     }
+}
+
+private fun buildMeteringRect(
+    tapX: Float,
+    tapY: Float,
+    viewWidth: Int,
+    viewHeight: Int,
+    sensorRect: Rect
+): MeteringRectangle {
+    val x = (tapX / viewWidth.toFloat()).coerceIn(0f, 1f)
+    val y = (tapY / viewHeight.toFloat()).coerceIn(0f, 1f)
+
+    val sensorX = (sensorRect.left + x * sensorRect.width()).toInt()
+    val sensorY = (sensorRect.top + y * sensorRect.height()).toInt()
+    val boxWidth = (sensorRect.width() * 0.08f).toInt().coerceAtLeast(120)
+    val boxHeight = (sensorRect.height() * 0.08f).toInt().coerceAtLeast(120)
+
+    val left = (sensorX - boxWidth / 2).coerceIn(sensorRect.left, sensorRect.right - boxWidth)
+    val top = (sensorY - boxHeight / 2).coerceIn(sensorRect.top, sensorRect.bottom - boxHeight)
+
+    return MeteringRectangle(left, top, boxWidth, boxHeight, MeteringRectangle.METERING_WEIGHT_MAX)
 }
 
 private fun applyPreviewTransform(
@@ -1063,8 +1211,11 @@ private fun UsbDevice.readableName(): String {
 @Composable
 private fun CameraSettingsDialog(
     isUsb: Boolean,
+    isLoading: Boolean,
     usbOptions: List<Size>,
     internalOptions: List<AndroidSize>,
+    selectedUsb: Size?,
+    selectedInternal: AndroidSize?,
     onSelectUsb: (Size) -> Unit,
     onSelectInternal: (AndroidSize) -> Unit,
     onDismiss: () -> Unit
@@ -1081,34 +1232,58 @@ private fun CameraSettingsDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Color(0xFF10263F),
+        shape = RoundedCornerShape(22.dp),
         title = {
-            Text(
-                text = "إعدادات الدقة",
-                color = Color.White,
-                fontWeight = FontWeight.Bold
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "إعدادات الدقة",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = if (isUsb) "كاميرا USB" else "كاميرا الهاتف",
+                    color = Color(0xFFBFD4EF),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (isUsb) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (isLoading) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        CircularProgressIndicator(color = Color.White)
+                    }
+                } else if (isUsb) {
                     if (usbList.isEmpty()) {
                         Text("لا توجد دقات متاحة لكاميرا USB", color = Color(0xFFD7E7FF))
-                    } else {
-                        usbList.forEach { s ->
-                            TextButton(onClick = { onSelectUsb(s) }) {
-                                Text("${s.width} x ${s.height}", color = Color.White)
-                            }
-                        }
+                    }
+                    usbList.forEach { s ->
+                        val isSelected = selectedUsb?.width == s.width && selectedUsb.height == s.height
+                        ResolutionCard(
+                            label = "${s.width} x ${s.height}",
+                            subtitle = if (isSelected) "الحالي" else "اضغط للتطبيق",
+                            selected = isSelected,
+                            onClick = { onSelectUsb(s) }
+                        )
                     }
                 } else {
                     if (internalList.isEmpty()) {
                         Text("لا توجد دقات متاحة لهذه الكاميرا", color = Color(0xFFD7E7FF))
-                    } else {
-                        internalList.forEach { s ->
-                            TextButton(onClick = { onSelectInternal(s) }) {
-                                Text("${s.width} x ${s.height}", color = Color.White)
-                            }
-                        }
+                    }
+                    internalList.forEach { s ->
+                        val isSelected = selectedInternal?.width == s.width && selectedInternal.height == s.height
+                        ResolutionCard(
+                            label = "${s.width} x ${s.height}",
+                            subtitle = if (isSelected) "الحالي" else "اضغط للتطبيق",
+                            selected = isSelected,
+                            onClick = { onSelectInternal(s) }
+                        )
                     }
                 }
             }
@@ -1120,4 +1295,37 @@ private fun CameraSettingsDialog(
             }
         }
     )
+}
+
+@Composable
+private fun ResolutionCard(
+    label: String,
+    subtitle: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        color = if (selected) Color(0xFF00A889) else Color(0xFF1E3B5E),
+        shape = RoundedCornerShape(14.dp),
+        tonalElevation = if (selected) 8.dp else 2.dp
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(
+                text = label,
+                color = Color.White,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                text = subtitle,
+                color = Color.White.copy(alpha = 0.85f),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
 }
